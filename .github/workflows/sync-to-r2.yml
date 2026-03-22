@@ -14,6 +14,10 @@ on:
         required: true
       R2_ENDPOINT:
         required: true
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
+      CLOUDFLARE_API_TOKEN:
+        required: false
 
 env:
   TENANT_ID: ${{ inputs.tenant_id || github.event.repository.name }}
@@ -93,3 +97,165 @@ jobs:
             --verbose \
             --stats-one-line
           echo "Sync complete"
+
+      - name: Register content in D1
+        if: steps.changes.outputs.has_changes == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          node << 'REGISTER_SCRIPT'
+          const fs = require('fs');
+          const path = require('path');
+
+          const PLATFORM_DB_ID = '7f5cc97d-9745-471c-bc3d-b2f208b42ae8';
+          const TENANT_ID = process.env.TENANT_ID;
+          const ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID;
+          const API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+
+          if (!TENANT_ID || !ACCOUNT_ID || !API_TOKEN) {
+            console.log('Cloudflare credentials not configured, skipping D1 registration');
+            process.exit(0);
+          }
+
+          async function d1(dbId, sql, params) {
+            const res = await fetch(
+              'https://api.cloudflare.com/client/v4/accounts/' + ACCOUNT_ID + '/d1/database/' + dbId + '/query',
+              {
+                method: 'POST',
+                headers: { 'Authorization': 'Bearer ' + API_TOKEN, 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sql: sql, params: params || [] })
+              }
+            );
+            const data = await res.json();
+            if (!res.ok || !data.success) {
+              var msg = (data.errors && data.errors[0] && data.errors[0].message) || ('D1 error ' + res.status);
+              throw new Error(msg);
+            }
+            return (data.result && data.result[0] && data.result[0].results) || [];
+          }
+
+          function readJson(filePath) {
+            try { return JSON.parse(fs.readFileSync(filePath, 'utf-8')); }
+            catch (e) { return null; }
+          }
+
+          function listDirs(dirPath) {
+            try {
+              return fs.readdirSync(dirPath, { withFileTypes: true })
+                .filter(function(d) { return d.isDirectory(); })
+                .map(function(d) { return d.name; });
+            } catch (e) { return []; }
+          }
+
+          async function main() {
+            console.log('Registering content for tenant: ' + TENANT_ID);
+
+            var rows = await d1(PLATFORM_DB_ID,
+              'SELECT database_id FROM tenant_registry WHERE id = ? LIMIT 1', [TENANT_ID]);
+            if (!rows.length) throw new Error('Tenant "' + TENANT_ID + '" not found in registry');
+            var dbId = rows[0].database_id;
+            console.log('Tenant DB: ' + dbId);
+
+            var moduleCount = 0, courseCount = 0, widgetCount = 0;
+            var moduleManifests = {};
+
+            // Register modules
+            var moduleDirs = listDirs('modules');
+            for (var mi = 0; mi < moduleDirs.length; mi++) {
+              var dir = moduleDirs[mi];
+              var manifest = readJson(path.join('modules', dir, 'manifest.json'));
+              if (!manifest) continue;
+              var id = manifest.id || dir;
+              moduleManifests[id] = manifest;
+
+              var lessons = (manifest.lessons || []).filter(function(l) { return l.type !== 'quiz'; }).length;
+              var quizzes = (manifest.lessons || []).filter(function(l) { return l.type === 'quiz'; }).length;
+
+              await d1(dbId,
+                "INSERT INTO modules (id, r2_base_path, title, description, total_lessons, total_quizzes, status) " +
+                "VALUES (?, ?, ?, ?, ?, ?, 'active') " +
+                "ON CONFLICT(id) DO UPDATE SET " +
+                "title=excluded.title, description=excluded.description, " +
+                "total_lessons=excluded.total_lessons, total_quizzes=excluded.total_quizzes, " +
+                "updated_at=datetime('now')",
+                [id, 'tenants/' + TENANT_ID + '/modules/' + id, manifest.title || id, manifest.description || null, lessons, quizzes]
+              );
+              console.log('  Module: ' + id + ' (' + lessons + ' lessons, ' + quizzes + ' quizzes)');
+              moduleCount++;
+            }
+
+            // Register courses
+            var courseDirs = listDirs('courses');
+            for (var ci = 0; ci < courseDirs.length; ci++) {
+              var cdir = courseDirs[ci];
+              var course = readJson(path.join('courses', cdir, 'course.json'));
+              if (!course) continue;
+              var cid = course.id || cdir;
+              var moduleIds = course.modules || [];
+
+              var totalLessons = 0, totalQuizzes = 0;
+              for (var j = 0; j < moduleIds.length; j++) {
+                var mod = moduleManifests[moduleIds[j]];
+                if (mod) {
+                  totalLessons += (mod.lessons || []).filter(function(l) { return l.type !== 'quiz'; }).length;
+                  totalQuizzes += (mod.lessons || []).filter(function(l) { return l.type === 'quiz'; }).length;
+                }
+              }
+
+              await d1(dbId,
+                "INSERT INTO courses (id, r2_base_path, r2_manifest_path, title, description, " +
+                "total_modules, total_lessons, total_quizzes, cover_image, " +
+                "access_type, status, manifest_format) " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'public', 'active', 'blueprint') " +
+                "ON CONFLICT(id) DO UPDATE SET " +
+                "title=excluded.title, description=excluded.description, " +
+                "total_modules=excluded.total_modules, total_lessons=excluded.total_lessons, " +
+                "total_quizzes=excluded.total_quizzes, cover_image=excluded.cover_image, " +
+                "updated_at=datetime('now')",
+                [cid, 'tenants/' + TENANT_ID + '/courses/' + cid,
+                 'tenants/' + TENANT_ID + '/courses/' + cid + '/course.json',
+                 course.title || cid, course.description || null,
+                 moduleIds.length, totalLessons, totalQuizzes,
+                 course.coverImage || null]
+              );
+
+              // Rebuild course_modules junction
+              await d1(dbId, 'DELETE FROM course_modules WHERE course_id = ?', [cid]);
+              for (var k = 0; k < moduleIds.length; k++) {
+                await d1(dbId,
+                  "INSERT INTO course_modules (course_id, module_id, slot_id, slot_type, slot_order) " +
+                  "VALUES (?, ?, ?, 'core', ?)",
+                  [cid, moduleIds[k], 'core-' + k, k]
+                );
+              }
+              console.log('  Course: ' + cid + ' (' + moduleIds.length + ' modules, ' + totalLessons + ' lessons)');
+              courseCount++;
+            }
+
+            // Register widgets
+            try {
+              var widgetFiles = fs.readdirSync('widgets').filter(function(f) { return f.endsWith('.html'); });
+              for (var wi = 0; wi < widgetFiles.length; wi++) {
+                var wfile = widgetFiles[wi];
+                var wid = wfile.replace('.html', '');
+                var wtitle = wid.split('-').map(function(w) { return w[0].toUpperCase() + w.slice(1); }).join(' ');
+
+                await d1(dbId,
+                  "INSERT INTO widgets (id, title, r2_path, github_path, status) " +
+                  "VALUES (?, ?, ?, ?, 'active') " +
+                  "ON CONFLICT(id) DO UPDATE SET " +
+                  "r2_path=excluded.r2_path, github_path=excluded.github_path, " +
+                  "updated_at=datetime('now')",
+                  [wid, wtitle, 'tenants/' + TENANT_ID + '/widgets/' + wfile, 'widgets/' + wfile]
+                );
+                console.log('  Widget: ' + wid);
+                widgetCount++;
+              }
+            } catch (e) { /* no widgets dir */ }
+
+            console.log('\nRegistered ' + courseCount + ' courses, ' + moduleCount + ' modules, ' + widgetCount + ' widgets');
+          }
+
+          main().catch(function(err) { console.error('D1 registration failed:', err.message); process.exit(1); });
+          REGISTER_SCRIPT
