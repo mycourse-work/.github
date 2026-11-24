@@ -38,6 +38,9 @@ jobs:
           lfs: true
           fetch-depth: 2
 
+      - name: Check widgets for CDN and remote dependencies
+        uses: mycourse-work/.github/.github/actions/check-widget-dependencies@main
+
       - name: Detect changed files
         id: changes
         run: |
