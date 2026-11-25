@@ -213,7 +213,7 @@ jobs:
                 "INSERT INTO courses (id, r2_base_path, r2_manifest_path, title, description, " +
                 "total_modules, total_lessons, total_quizzes, cover_image, " +
                 "access_type, status, manifest_format) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'public', 'active', 'blueprint') " +
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'public', 'draft', 'blueprint') " +
                 "ON CONFLICT(id) DO UPDATE SET " +
                 "title=excluded.title, description=excluded.description, " +
                 "total_modules=excluded.total_modules, total_lessons=excluded.total_lessons, " +
