@@ -1,8 +1,10 @@
 """Tests for the org reusable sync-to-r2 workflow's D1 course registration SQL."""
 
+import json
 from pathlib import Path
 import re
 import sqlite3
+import subprocess
 from unittest import TestCase, main
 
 WORKFLOW_PATH = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "sync-to-r2.yml"
@@ -114,6 +116,77 @@ class SyncCourseDraftDefaultTests(TestCase):
             self.assertEqual(status, expected_status, f"status changed for {cid}")
             self.assertEqual(title, f"Updated {cid}")
             self.assertEqual((mods, lessons, quizzes), (4, 10, 3))
+
+
+class SyncWidgetReleaseTests(TestCase):
+    def test_only_published_course_and_standalone_widgets_upload_and_register(self):
+        workflow = WORKFLOW_PATH.read_text(encoding="utf-8")
+        upload, register = workflow.split("- name: Register content in D1", 1)
+        self.assertIn('[[ "$file" == widgets/* ]] && continue', upload)
+        # Execute the real registration script with in-memory filesystem, D1,
+        # and transfer doubles. The first course is already serving learners.
+        script = register.split("node << 'REGISTER_SCRIPT'\n", 1)[1].split("\n          REGISTER_SCRIPT", 1)[0]
+        harness = r"""
+const vm = require('node:vm');
+const { posix: path } = require('node:path');
+const files = {
+  'courses/live/course.json': '{"modules":["live-module"]}',
+  'courses/draft/course.json': '{"modules":["draft-module"]}',
+  'modules/live-module/manifest.json': '{"lessons":[{"markdownPath":"lesson.md"}]}',
+  'modules/draft-module/manifest.json': '{"lessons":[{"markdownPath":"lesson.md"}]}',
+  'modules/live-module/lesson.md': ':::widget live-widget\n:::\n',
+  'modules/draft-module/lesson.md': ':::widget held-widget\n:::\n',
+  'widgets/live-widget.html': '<p>Live</p>',
+  'widgets/held-widget.html': '<p>Held</p>',
+  'widgets/standalone.html': '<p>Standalone</p>',
+  'widgets/unlinked.html': '<p>Unlinked</p>',
+};
+const fs = {
+  readFileSync: key => files[key],
+  existsSync: key => key in files,
+  lstatSync: () => ({ isFile: () => true }),
+  readdirSync: () => [],
+};
+const calls = [];
+async function fetch(_url, {body}) {
+  const {sql, params} = JSON.parse(body);
+  let results = [];
+  if (sql.includes('tenant_registry')) {
+    results = [{ database_id: 'fixture', features: '{"standaloneWidgets":["standalone.html"]}' }];
+  }
+  if (sql.startsWith('INSERT INTO widgets')) calls.push(['register', params[3]]);
+  return { ok: true, json: async () => ({ success: true, result: [{ results }] }) };
+}
+async function run(published) {
+  calls.length = 0;
+  await vm.runInNewContext(SCRIPT, {
+    require: name => ({ fs, path, child_process: {
+      execFileSync: (_cmd, _args, options) => calls.push(['upload', options.input.trim().split('\n')]),
+    } }[name]),
+    process: { env: { TENANT_ID: 'demo', CLOUDFLARE_ACCOUNT_ID: 'fixture',
+      CLOUDFLARE_API_TOKEN: 'fixture', CONTENT_CHANGED: 'true' }, exit: code => { throw Error(code); } },
+    fetch: (url, options) => query(published, url, options),
+    console: { log() {}, error: console.error },
+  });
+  return calls.slice();
+}
+async function query(published, url, options) {
+  const {sql} = JSON.parse(options.body);
+  if (sql.includes("status IN ('active', 'published')")) {
+    return { ok: true, json: async () => ({ success: true, result: [{ results: published.map(id => ({id})) }] }) };
+  }
+  return fetch(url, options);
+}
+(async () => console.log(JSON.stringify([await run(['live']), await run(['live', 'draft'])])))();
+"""
+        result = subprocess.run(
+            ["node", "-"], input="const SCRIPT = " + json.dumps(script) + ";\n" + harness,
+            text=True, capture_output=True, check=True,
+        )
+        before, after = json.loads(result.stdout)
+        for calls, allowed in ((before, ["standalone", "live-widget"]), (after, ["standalone", "live-widget", "held-widget"])):
+            paths = [f"widgets/{name}.html" for name in allowed]
+            self.assertEqual(calls, [["upload", paths]] + [["register", path] for path in paths])
 
 
 if __name__ == "__main__":

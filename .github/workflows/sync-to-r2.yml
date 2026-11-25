@@ -85,6 +85,8 @@ jobs:
           # Filter to only files that exist (skip deletes)
           > /tmp/upload-files.txt
           while IFS= read -r file; do
+            # Shared widgets are uploaded only after publication has been verified.
+            [[ "$file" == widgets/* ]] && continue
             if [ -f "$file" ]; then
               echo "$file" >> /tmp/upload-files.txt
             else
@@ -109,10 +111,12 @@ jobs:
         env:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CONTENT_CHANGED: ${{ steps.changes.outputs.has_changes }}
         run: |
           node << 'REGISTER_SCRIPT'
           const fs = require('fs');
           const path = require('path');
+          const { execFileSync } = require('child_process');
 
           const PLATFORM_DB_ID = '7f5cc97d-9745-471c-bc3d-b2f208b42ae8';
           const TENANT_ID = process.env.TENANT_ID;
@@ -154,11 +158,64 @@ jobs:
             } catch (e) { return []; }
           }
 
+          function releasedWidgets(publishedCourseIds, standaloneWidgets) {
+            const files = new Set(Array.isArray(standaloneWidgets) ? standaloneWidgets : []);
+            const lessonPaths = new Set();
+
+            function addLesson(base, file) {
+              if (typeof file === 'string' && file.split('/').every(part => part && part !== '.' && part !== '..')) {
+                lessonPaths.add(path.join(base, file));
+              }
+            }
+
+            for (const cid of publishedCourseIds) {
+              if (!/^[a-zA-Z0-9_-]+$/.test(cid)) continue;
+              const base = path.join('courses', cid);
+              const blueprint = readJson(path.join(base, 'blueprint.json'));
+              const course = readJson(path.join(base, 'course.json'));
+              if (blueprint || course) {
+                addLesson(base, (blueprint || course).welcomePath);
+                const moduleIds = blueprint
+                  ? [...blueprint.coreModules, ...(blueprint.electiveGroups || []).flatMap(group => group.options)]
+                    .map(slot => slot.moduleId)
+                  : course.modules || [];
+                for (const id of new Set(moduleIds)) {
+                  if (!/^[a-zA-Z0-9_-]+$/.test(id)) continue;
+                  const folder = path.join('modules', id);
+                  const module = readJson(path.join(folder, 'manifest.json'));
+                  for (const lesson of module?.lessons || []) {
+                    if (lesson.type !== 'quiz') addLesson(folder, lesson.markdownPath);
+                  }
+                }
+              } else {
+                const manifest = readJson(path.join(base, 'manifest.json'));
+                for (const module of manifest?.modules || []) {
+                  for (const lesson of module.lessons || []) {
+                    if (lesson.type === 'quiz') continue;
+                    const relative = lesson.markdownPath?.replace(/^\//, '');
+                    const prefix = `courses/${cid}/`;
+                    addLesson(base, relative?.startsWith(prefix) ? relative.slice(prefix.length) : relative);
+                  }
+                }
+              }
+            }
+
+            for (const lessonPath of lessonPaths) {
+              if (!fs.existsSync(lessonPath)) continue;
+              const markdown = fs.readFileSync(lessonPath, 'utf8');
+              for (const match of markdown.matchAll(/:::widget[^\S\r\n]+([^\r\n]+)\r?\n[\s\S]*?:::/g)) {
+                files.add(match[1].trim() + '.html');
+              }
+            }
+            return [...files].filter(file => typeof file === 'string' && /^[a-zA-Z0-9_-]+\.html$/.test(file)
+              && fs.existsSync(path.join('widgets', file)) && fs.lstatSync(path.join('widgets', file)).isFile());
+          }
+
           async function main() {
             console.log('Registering content for tenant: ' + TENANT_ID);
 
             var rows = await d1(PLATFORM_DB_ID,
-              'SELECT database_id FROM tenant_registry WHERE id = ? LIMIT 1', [TENANT_ID]);
+              'SELECT database_id, features FROM tenant_registry WHERE id = ? LIMIT 1', [TENANT_ID]);
             if (!rows.length) throw new Error('Tenant "' + TENANT_ID + '" not found in registry');
             var dbId = rows[0].database_id;
             console.log('Tenant DB: ' + dbId);
@@ -239,26 +296,35 @@ jobs:
               courseCount++;
             }
 
-            // Register widgets
-            try {
-              var widgetFiles = fs.readdirSync('widgets').filter(function(f) { return f.endsWith('.html'); });
-              for (var wi = 0; wi < widgetFiles.length; wi++) {
-                var wfile = widgetFiles[wi];
-                var wid = wfile.replace('.html', '');
-                var wtitle = wid.split('-').map(function(w) { return w[0].toUpperCase() + w.slice(1); }).join(' ');
+            // Reconsider previously held widgets on every content sync, even if their files did not change.
+            if (process.env.CONTENT_CHANGED === 'true') {
+              const published = await d1(dbId,
+                "SELECT id FROM courses WHERE status IN ('active', 'published') AND id NOT LIKE 'module:%'");
+              const features = JSON.parse(rows[0].features || '{}');
+              const widgetFiles = releasedWidgets(published.map(course => course.id), features.standaloneWidgets);
+              if (widgetFiles.length) {
+                execFileSync('rclone', [
+                  'copy', '.', 'r2:course-viewer-content/tenants/' + TENANT_ID,
+                  '--files-from', '-', '--transfers', '8', '--stats-one-line'
+                ], { input: widgetFiles.map(file => 'widgets/' + file).join('\n') + '\n', stdio: ['pipe', 'inherit', 'inherit'] });
+              }
 
+              for (const wfile of widgetFiles) {
+                const wid = wfile.slice(0, -5);
+                const wtitle = wid.split('-').filter(Boolean).map(word => word[0].toUpperCase() + word.slice(1)).join(' ');
                 await d1(dbId,
                   "INSERT INTO widgets (id, title, r2_path, github_path, status) " +
                   "VALUES (?, ?, ?, ?, 'active') " +
                   "ON CONFLICT(id) DO UPDATE SET " +
                   "r2_path=excluded.r2_path, github_path=excluded.github_path, " +
+                  "status=CASE WHEN widgets.status = 'draft' THEN excluded.status ELSE widgets.status END, " +
                   "updated_at=datetime('now')",
                   [wid, wtitle, 'tenants/' + TENANT_ID + '/widgets/' + wfile, 'widgets/' + wfile]
                 );
                 console.log('  Widget: ' + wid);
                 widgetCount++;
               }
-            } catch (e) { /* no widgets dir */ }
+            }
 
             console.log('\nRegistered ' + courseCount + ' courses, ' + moduleCount + ' modules, ' + widgetCount + ' widgets');
           }
