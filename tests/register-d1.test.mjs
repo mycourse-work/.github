@@ -1,8 +1,7 @@
 import assert from 'node:assert/strict'
-import { execFile } from 'node:child_process'
+import { execFile, execFileSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import http from 'node:http'
-import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { DatabaseSync } from 'node:sqlite'
 import { test } from 'node:test'
@@ -16,6 +15,7 @@ const workflowPath = join(repoRoot, '.github', 'workflows', 'sync-to-r2.yml')
 
 const PLATFORM_DB_ID = '7f5cc97d-9745-471c-bc3d-b2f208b42ae8'
 const TENANT_DB_ID = '11111111-2222-3333-4444-555555555555'
+const DUMMY_ENV = { TENANT_ID: 'dronetrust', CLOUDFLARE_ACCOUNT_ID: 'fixture-account', CLOUDFLARE_API_TOKEN: 'fixture-token' }
 
 const PLATFORM_SCHEMA = `
 CREATE TABLE tenant_registry (
@@ -163,23 +163,13 @@ function createMockD1Server({ platformDb, tenantDb, fault } = {}) {
     }
 
     try {
-      if (isBatch) {
-        assert.equal(body.sql, undefined, 'D1 request cannot combine sql and batch')
-        db.exec('BEGIN')
-        try {
-          const results = body.batch.map(stmt => runStatement(db, stmt))
-          db.exec('COMMIT')
-          res.writeHead(200, { 'content-type': 'application/json' })
-          res.end(JSON.stringify({ success: true, result: results }))
-        } catch (err) {
-          db.exec('ROLLBACK')
-          throw err
-        }
-      } else {
-        const result = runStatement(db, body)
-        res.writeHead(200, { 'content-type': 'application/json' })
-        res.end(JSON.stringify({ success: true, result: [result] }))
-      }
+      assert.ok(calls[callIndex].statementCount <= 50, 'D1 request exceeded 50 statements')
+      assert.ok(calls[callIndex].bodyBytes <= 512 * 1024, 'D1 request exceeded 512 KiB')
+      if (isBatch) assert.equal(body.sql, undefined, 'D1 request cannot combine sql and batch')
+      // Each statement commits independently to exercise failures without batch rollback.
+      const results = (isBatch ? body.batch : [body]).map(stmt => runStatement(db, stmt))
+      res.writeHead(200, { 'content-type': 'application/json' })
+      res.end(JSON.stringify({ success: true, result: results }))
     } catch (err) {
       res.writeHead(400, { 'content-type': 'application/json' })
       res.end(JSON.stringify({ success: false, errors: [{ code: 7500, message: err.message }] }))
@@ -198,20 +188,24 @@ function createMockD1Server({ platformDb, tenantDb, fault } = {}) {
   }
 }
 
-function createFixtureDatabases(tenantId = 'dronetrust') {
+function createFixtureDatabases(tenantId = 'dronetrust', {
+  platformSchema = PLATFORM_SCHEMA, tenantSchema = TENANT_SCHEMA,
+} = {}) {
   const platformDb = new DatabaseSync(':memory:')
-  platformDb.exec(PLATFORM_SCHEMA)
+  platformDb.exec(platformSchema)
   platformDb.prepare(
-    'INSERT INTO tenant_registry (id, name, domain_primary, database_name, database_id) VALUES (?, ?, ?, ?, ?)'
+    "INSERT INTO tenant_registry (id, name, domain_primary, database_name, database_id, branding, auth) VALUES (?, ?, ?, ?, ?, '{}', '{}')"
   ).run(tenantId, tenantId, `${tenantId}.example`, `cv-tenant-${tenantId}`, TENANT_DB_ID)
 
   const tenantDb = new DatabaseSync(':memory:')
-  tenantDb.exec(TENANT_SCHEMA)
+  tenantDb.function('datetime', (_value) => '2026-11-25 00:00:00')
+  tenantDb.exec(tenantSchema)
+  assert.equal(tenantDb.prepare('PRAGMA foreign_keys').get().foreign_keys, 1)
   return { platformDb, tenantDb }
 }
 
 async function runScript(scriptSource, { cwd, env, mockOrigin }) {
-  const work = mkdtempSync(join(tmpdir(), 'd1-register-run-'))
+  const work = mkdtempSync(join(repoRoot, 'd1-register-run-'))
   try {
     const scriptFile = join(work, 'register.cjs')
     writeFileSync(scriptFile, scriptSource)
@@ -291,8 +285,8 @@ function writeDroneTrustSizedRepo(dir, { modules = 33, courses = 6, widgets = 85
 
 const scriptSource = extractRegisterScript(readFileSync(workflowPath, 'utf8'))
 
-test('registers a DroneTrust-sized repo in 2 HTTP calls and preserves upsert/delete semantics', async () => {
-  const repoDir = mkdtempSync(join(tmpdir(), 'd1-dt-fixture-'))
+test('registers a DroneTrust-sized repo in 3 HTTP calls and preserves upsert/delete semantics', async () => {
+  const repoDir = mkdtempSync(join(repoRoot, 'd1-dt-fixture-'))
   const { platformDb, tenantDb } = createFixtureDatabases('dronetrust')
 
   // Seed pre-existing rows to verify ON CONFLICT DO UPDATE preserves status/access_type and deletes stale junctions.
@@ -319,7 +313,7 @@ test('registers a DroneTrust-sized repo in 2 HTTP calls and preserves upsert/del
       env: { TENANT_ID: 'dronetrust', CLOUDFLARE_ACCOUNT_ID: 'acct-1', CLOUDFLARE_API_TOKEN: 'tok-1' },
     })
     assert.equal(result.exitCode, 0, result.stderr || result.stdout)
-    assert.equal(mock.calls.length, 2, `Expected 2 HTTP calls (1 lookup + 1 batch), got ${mock.calls.length}`)
+    assert.equal(mock.calls.length, 3, 'Expected lookup, upserts and cleanup')
     assert.equal(mock.calls[0].dbId, PLATFORM_DB_ID)
     assert.equal(mock.calls[0].isBatch, false)
     assert.equal(mock.calls[1].dbId, TENANT_DB_ID)
@@ -351,7 +345,7 @@ test('registers a DroneTrust-sized repo in 2 HTTP calls and preserves upsert/del
 })
 
 test('skips registration with exit 0 and zero HTTP calls when Cloudflare credentials are missing', async () => {
-  const repoDir = mkdtempSync(join(tmpdir(), 'd1-skip-'))
+  const repoDir = mkdtempSync(join(repoRoot, 'd1-skip-'))
   const { platformDb, tenantDb } = createFixtureDatabases('dronetrust')
   const mock = createMockD1Server({ platformDb, tenantDb })
   const origin = await mock.start()
@@ -374,7 +368,7 @@ test('skips registration with exit 0 and zero HTTP calls when Cloudflare credent
 
 test('handles missing widgets dir, empty repo, and large tenants across multiple batches', async () => {
   // Empty repo: only 1 platform lookup call, 0 tenant batch calls.
-  const emptyDir = mkdtempSync(join(tmpdir(), 'd1-empty-'))
+  const emptyDir = mkdtempSync(join(repoRoot, 'd1-empty-'))
   const { platformDb: p1, tenantDb: t1 } = createFixtureDatabases('empty-tenant')
   const m1 = createMockD1Server({ platformDb: p1, tenantDb: t1 })
   const o1 = await m1.start()
@@ -391,8 +385,8 @@ test('handles missing widgets dir, empty repo, and large tenants across multiple
     rmSync(emptyDir, { recursive: true, force: true })
   }
 
-  // Large tenant (>50 statements) chunks cleanly into multiple batches without splitting any course junction group.
-  const largeDir = mkdtempSync(join(tmpdir(), 'd1-large-'))
+  // Large tenant uses separate upsert and cleanup requests.
+  const largeDir = mkdtempSync(join(repoRoot, 'd1-large-'))
   const { platformDb: p2, tenantDb: t2 } = createFixtureDatabases('big-tenant')
   const m2 = createMockD1Server({ platformDb: p2, tenantDb: t2 })
   const o2 = await m2.start()
@@ -417,7 +411,7 @@ test('handles missing widgets dir, empty repo, and large tenants across multiple
 })
 
 test('fails the step with non-zero exit when any batch statement or API response fails', async () => {
-  const repoDir = mkdtempSync(join(tmpdir(), 'd1-fail-'))
+  const repoDir = mkdtempSync(join(repoRoot, 'd1-fail-'))
   writeDroneTrustSizedRepo(repoDir, { modules: 2, courses: 1, widgets: 2 })
 
   const faultCases = [
@@ -464,6 +458,212 @@ test('fails the step with non-zero exit when any batch statement or API response
       } finally {
         await mock.close()
       }
+    }
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true })
+  }
+})
+
+test('splits inserts by serialized UTF-8 bytes and rejects an oversized single row before tenant writes', async () => {
+  const repoDir = mkdtempSync(join(repoRoot, 'd1-byte-limit-'))
+  const { platformDb, tenantDb } = createFixtureDatabases()
+  const mock = createMockD1Server({ platformDb, tenantDb })
+  const mockOrigin = await mock.start()
+  const description = '🚀'.repeat(10_000)
+  try {
+    writeDroneTrustSizedRepo(repoDir, { modules: 16, courses: 1, widgets: 0 })
+    for (let i = 1; i <= 16; i++) {
+      const id = `mod-${String(i).padStart(2, '0')}`
+      writeFileSync(join(repoDir, 'modules', id, 'manifest.json'), JSON.stringify({ id, description }))
+    }
+    const run = () => runScript(scriptSource, { cwd: repoDir, mockOrigin, env: DUMMY_ENV })
+    const result = await run()
+    assert.equal(result.exitCode, 0, result.stderr)
+    assert.ok(mock.calls.filter(call => call.dbId === TENANT_DB_ID && call.bodyBytes > 40_000).length >= 2)
+    const descriptions = tenantDb.prepare('SELECT description FROM modules').all()
+    assert.equal(descriptions.length, 16)
+    assert.ok(descriptions.every(row => row.description === description))
+
+    writeFileSync(join(repoDir, 'modules', 'mod-16', 'manifest.json'), JSON.stringify({ description: description.repeat(14) }))
+    mock.calls.length = 0
+    const oversized = await run()
+    assert.equal(oversized.exitCode, 1)
+    assert.match(oversized.stderr, /D1 insert row exceeds statement or request limits/)
+    assert.deepEqual(mock.calls.map(call => call.dbId), [PLATFORM_DB_ID])
+  } finally {
+    await mock.close()
+    rmSync(repoDir, { recursive: true, force: true })
+  }
+})
+
+test('keeps every request within 50 statements for a single course with 1,177 junctions', async () => {
+  const repoDir = mkdtempSync(join(repoRoot, 'd1-statement-limit-'))
+  const { platformDb, tenantDb } = createFixtureDatabases()
+  const mock = createMockD1Server({ platformDb, tenantDb })
+  const mockOrigin = await mock.start()
+  try {
+    writeDroneTrustSizedRepo(repoDir, { modules: 2, courses: 1, widgets: 0 })
+    const modules = Array.from({ length: 1_177 }, (_, i) => i % 2 ? 'mod-02' : 'mod-01')
+    writeFileSync(join(repoDir, 'courses', 'course-1', 'course.json'), JSON.stringify({ modules }))
+    const result = await runScript(scriptSource, { cwd: repoDir, mockOrigin, env: DUMMY_ENV })
+    assert.equal(result.exitCode, 0, result.stderr)
+    assert.ok(mock.calls.some(call => call.statementCount === 50))
+    const junctions = tenantDb.prepare('SELECT module_id, slot_id, slot_order FROM course_modules ORDER BY slot_order').all()
+    assert.deepEqual(junctions.map(row => [row.module_id, row.slot_id, row.slot_order]),
+      modules.map((id, i) => [id, `core-${i}`, i]))
+  } finally {
+    await mock.close()
+    rmSync(repoDir, { recursive: true, force: true })
+  }
+})
+
+test('keeps existing junctions through a partial install and retains the new set through a failure after pruning', async () => {
+  const repoDir = mkdtempSync(join(repoRoot, 'd1-junction-fail-'))
+  const { platformDb, tenantDb } = createFixtureDatabases()
+  const mock = createMockD1Server({ platformDb, tenantDb })
+  const mockOrigin = await mock.start()
+  try {
+    writeDroneTrustSizedRepo(repoDir, { modules: 30, courses: 1, widgets: 1 })
+    tenantDb.exec(`
+      INSERT INTO courses (id, title, r2_base_path, r2_manifest_path) VALUES ('course-1', 'Old', 'old', 'old');
+      INSERT INTO modules (id, title, r2_base_path) VALUES ('mod-01', 'Old', 'old');
+      INSERT INTO course_modules (course_id, module_id, slot_id, slot_order)
+        VALUES ('course-1', 'mod-01', 'core-26', 26), ('course-1', 'mod-01', 'stale', 99);
+      CREATE TRIGGER fail_install BEFORE INSERT ON course_modules
+        WHEN NEW.slot_id = 'core-24' BEGIN SELECT RAISE(ABORT, 'fixture install failure'); END;
+    `)
+    const existing = tenantDb.prepare("SELECT * FROM course_modules WHERE slot_id IN ('core-26', 'stale') ORDER BY id")
+    const before = existing.all()
+    const run = () => runScript(scriptSource, { cwd: repoDir, mockOrigin, env: DUMMY_ENV })
+
+    const failedInstall = await run()
+    assert.equal(failedInstall.exitCode, 1)
+    assert.match(failedInstall.stderr, /fixture install failure/)
+    assert.deepEqual(existing.all(), before)
+    assert.equal(tenantDb.prepare('SELECT count(*) AS n FROM course_modules').get().n, 26)
+    assert.ok(mock.calls.every(call => !call.body.batch?.some(stmt => /^DELETE /i.test(stmt.sql))))
+
+    tenantDb.exec(`
+      DROP TRIGGER fail_install;
+      CREATE TRIGGER fail_widget BEFORE INSERT ON widgets
+        BEGIN SELECT RAISE(ABORT, 'fixture widget failure'); END;
+    `)
+    const failedAfterDelete = await run()
+    assert.equal(failedAfterDelete.exitCode, 1)
+    assert.match(failedAfterDelete.stderr, /fixture widget failure/)
+    assert.equal(tenantDb.prepare("SELECT module_id FROM course_modules WHERE slot_id = 'core-26'").get().module_id, 'mod-27')
+    assert.equal(tenantDb.prepare("SELECT count(*) AS n FROM course_modules WHERE slot_id = 'stale'").get().n, 0)
+    assert.equal(tenantDb.prepare('SELECT count(*) AS n FROM course_modules').get().n, 30)
+  } finally {
+    await mock.close()
+    rmSync(repoDir, { recursive: true, force: true })
+  }
+})
+
+test('registers modules, courses and earlier widgets when a widget has an empty title segment', async () => {
+  const repoDir = mkdtempSync(join(repoRoot, 'd1-widget-name-'))
+  const { platformDb, tenantDb } = createFixtureDatabases()
+  const mock = createMockD1Server({ platformDb, tenantDb })
+  const mockOrigin = await mock.start()
+  try {
+    writeDroneTrustSizedRepo(repoDir, { modules: 1, courses: 1, widgets: 0 })
+    mkdirSync(join(repoDir, 'widgets'))
+    for (const name of ['air-check.html', 'flight--check.html', 'weather-check.html']) {
+      writeFileSync(join(repoDir, 'widgets', name), '<p>ok</p>')
+    }
+    const result = await runScript(scriptSource, { cwd: repoDir, mockOrigin, env: DUMMY_ENV })
+    assert.equal(result.exitCode, 0, result.stderr)
+    for (const table of ['modules', 'courses', 'course_modules']) {
+      assert.equal(tenantDb.prepare(`SELECT count(*) AS n FROM ${table}`).get().n, 1, table)
+    }
+    assert.deepEqual(tenantDb.prepare('SELECT title FROM widgets').all().map(row => row.title), ['Air Check'])
+  } finally {
+    await mock.close()
+    rmSync(repoDir, { recursive: true, force: true })
+  }
+})
+
+// Fetch these revisions in the two source repos before running the differential offline:
+// D1_PLATFORM_REPO=/path/to/course.platform D1_CONTENT_REPO=/path/to/dronetrust \
+//   node --test --test-reporter=dot --test-name-pattern='pinned-base' tests/register-d1.test.mjs
+const BASE_SHA = '4367ef784203fd10f9717d681619011f33fee7d3'
+const PLATFORM_SHA = '850db6c364290b8b33b3ba7c95ab2aee511b0960'
+const CONTENT_SHA = 'ad2622ace95bd34ebf3502b4c70716085663440b'
+const platformRepo = process.env.D1_PLATFORM_REPO
+const contentRepo = process.env.D1_CONTENT_REPO
+
+function gitRead(repo, ...args) {
+  return execFileSync('git', ['-C', repo, ...args], {
+    encoding: 'utf8',
+    env: { PATH: process.env.PATH, GIT_NO_LAZY_FETCH: '1' },
+  })
+}
+
+test('pinned-base differential matches every catalog column on the DroneTrust fixture', {
+  skip: !(platformRepo || contentRepo) && 'Set D1_PLATFORM_REPO and D1_CONTENT_REPO to enable',
+}, async () => {
+  assert.ok(platformRepo && contentRepo, 'Set both D1_PLATFORM_REPO and D1_CONTENT_REPO')
+  const baseScript = extractRegisterScript(gitRead(repoRoot, 'show', `${BASE_SHA}:.github/workflows/sync-to-r2.yml`))
+  const migration = file => gitRead(platformRepo, 'show', `${PLATFORM_SHA}:workers/edge-router/migrations/${file}`)
+  const platformSchema = migration('platform/001_catalog.sql')
+  const tenantSchema = ['001_tenant_schema.sql', '006_modules_and_electives.sql', '007_widgets.sql']
+    .map(file => migration(`tenant/${file}`)).join('\n')
+
+  const files = gitRead(contentRepo, 'ls-tree', '-r', '--name-only', CONTENT_SHA, '--', 'courses', 'modules', 'widgets')
+    .trimEnd().split('\n')
+    .filter(file => /^(courses\/[^/]+\/course\.json|modules\/[^/]+\/manifest\.json|widgets\/[^/]+\.html)$/.test(file))
+  const firstCourse = files.find(file => file.startsWith('courses/'))
+  const course = JSON.parse(gitRead(contentRepo, 'show', `${CONTENT_SHA}:${firstCourse}`))
+  const courseId = course.id || firstCourse.split('/')[1]
+  const moduleId = course.modules[0]
+  const firstWidgetId = files.find(file => file.startsWith('widgets/')).slice('widgets/'.length, -'.html'.length)
+  const repoDir = mkdtempSync(join(repoRoot, 'd1-differential-'))
+  try {
+    for (const file of files) {
+      const target = join(repoDir, file)
+      mkdirSync(dirname(target), { recursive: true })
+      // The workflow only reads widget filenames.
+      writeFileSync(target, file.startsWith('widgets/') ? '' : gitRead(contentRepo, 'show', `${CONTENT_SHA}:${file}`))
+    }
+
+    async function snapshot(source, expectedCalls) {
+      const { platformDb, tenantDb } = createFixtureDatabases('dronetrust', { platformSchema, tenantSchema })
+      const mock = createMockD1Server({ platformDb, tenantDb })
+      const mockOrigin = await mock.start()
+      try {
+        const moduleInsert = tenantDb.prepare("INSERT INTO modules (id, title, r2_base_path, status) VALUES (?, 'Old', 'old', 'draft')")
+        moduleInsert.run(moduleId)
+        moduleInsert.run('removed-module')
+        const courseInsert = tenantDb.prepare(
+          "INSERT INTO courses (id, title, r2_base_path, r2_manifest_path, access_type, status) VALUES (?, 'Old', 'old', 'old', 'paid', 'published')")
+        courseInsert.run(courseId)
+        courseInsert.run('removed-course')
+        const slotInsert = tenantDb.prepare(
+          "INSERT INTO course_modules (course_id, module_id, slot_id, slot_type, elective_group_id, slot_order) VALUES (?, ?, ?, 'elective', 'group', 99)")
+        slotInsert.run(courseId, 'removed-module', 'core-0')
+        slotInsert.run(courseId, 'removed-module', 'stale')
+        slotInsert.run('removed-course', 'removed-module', 'core-0')
+        const widgetInsert = tenantDb.prepare("INSERT INTO widgets (id, title, status) VALUES (?, 'Custom title', 'draft')")
+        widgetInsert.run(firstWidgetId)
+        widgetInsert.run('removed-widget')
+
+        const result = await runScript(source, { cwd: repoDir, mockOrigin, env: DUMMY_ENV })
+        assert.equal(result.exitCode, 0, result.stderr)
+        assert.equal(mock.calls.length, expectedCalls)
+        return Object.fromEntries(['modules', 'courses', 'course_modules', 'widgets'].map(table =>
+          [table, tenantDb.prepare(`SELECT * FROM ${table} ORDER BY id`).all()]))
+      } finally {
+        await mock.close()
+        tenantDb.close()
+        platformDb.close()
+      }
+    }
+
+    const base = await snapshot(baseScript, 164)
+    const head = await snapshot(scriptSource, 3)
+    for (const [table, count] of Object.entries({ modules: 34, courses: 7, course_modules: 34, widgets: 86 })) {
+      assert.equal(head[table].length, count, table)
+      assert.deepEqual(head[table], base[table], table)
     }
   } finally {
     rmSync(repoDir, { recursive: true, force: true })
