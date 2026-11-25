@@ -1,0 +1,8 @@
+name: Check widget dependencies
+description: Reject remote widget dependencies before publishing course content
+runs:
+  using: composite
+  steps:
+    - name: Check widgets for remote dependencies
+      shell: bash
+      run: python3 "$GITHUB_ACTION_PATH/check.py" "$GITHUB_WORKSPACE/widgets"
