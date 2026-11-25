@@ -124,21 +124,106 @@ jobs:
             process.exit(0);
           }
 
-          async function d1(dbId, sql, params) {
+          const MAX_PARAMS_PER_STMT = 96;
+          const MAX_SQL_BYTES = 64 * 1024;
+          const MAX_BATCH_STATEMENTS = 50;
+          const MAX_BATCH_BYTES = 512 * 1024;
+
+          async function d1Request(dbId, payload, expectedCount) {
             const res = await fetch(
               'https://api.cloudflare.com/client/v4/accounts/' + ACCOUNT_ID + '/d1/database/' + dbId + '/query',
               {
                 method: 'POST',
                 headers: { 'Authorization': 'Bearer ' + API_TOKEN, 'Content-Type': 'application/json' },
-                body: JSON.stringify({ sql: sql, params: params || [] })
+                body: JSON.stringify(payload)
               }
             );
-            const data = await res.json();
-            if (!res.ok || !data.success) {
-              var msg = (data.errors && data.errors[0] && data.errors[0].message) || ('D1 error ' + res.status);
+            const data = await res.json().catch(function() { return null; });
+            if (!res.ok || !data || data.success !== true) {
+              var msg = (data && data.errors && data.errors[0] && data.errors[0].message) || ('D1 error ' + res.status);
               throw new Error(msg);
             }
-            return (data.result && data.result[0] && data.result[0].results) || [];
+            if (!Array.isArray(data.result) || data.result.length !== expectedCount) {
+              throw new Error('D1 returned ' + (Array.isArray(data.result) ? data.result.length : 0) + ' result(s), expected ' + expectedCount);
+            }
+            for (var i = 0; i < data.result.length; i++) {
+              if (!data.result[i] || data.result[i].success !== true) {
+                var stmtErr = (data.result[i] && data.result[i].error) || 'statement failed';
+                throw new Error('D1 statement #' + i + ' failed: ' + stmtErr);
+              }
+            }
+            return data.result;
+          }
+
+          async function d1Query(dbId, sql, params) {
+            var results = await d1Request(dbId, { sql: sql, params: params || [] }, 1);
+            return results[0].results || [];
+          }
+
+          async function d1Batch(dbId, statements) {
+            if (!statements.length) return;
+            await d1Request(dbId, { batch: statements }, statements.length);
+          }
+
+          function buildMultiRowStatements(prefixSql, rowPlaceholder, suffixSql, rows) {
+            var statements = [];
+            if (!rows.length) return statements;
+            var baseBytes = Buffer.byteLength(prefixSql) + Buffer.byteLength(suffixSql);
+            var placeholderBytes = Buffer.byteLength(rowPlaceholder) + 2;
+            var chunkPlaceholders = [];
+            var chunkParams = [];
+            var chunkSqlBytes = baseBytes;
+
+            function flush() {
+              if (!chunkPlaceholders.length) return;
+              statements.push({
+                sql: prefixSql + chunkPlaceholders.join(', ') + suffixSql,
+                params: chunkParams
+              });
+              chunkPlaceholders = [];
+              chunkParams = [];
+              chunkSqlBytes = baseBytes;
+            }
+
+            for (var i = 0; i < rows.length; i++) {
+              var row = rows[i];
+              if (chunkPlaceholders.length > 0 &&
+                  (chunkParams.length + row.length > MAX_PARAMS_PER_STMT ||
+                   chunkSqlBytes + placeholderBytes > MAX_SQL_BYTES)) {
+                flush();
+              }
+              chunkPlaceholders.push(rowPlaceholder);
+              for (var j = 0; j < row.length; j++) chunkParams.push(row[j]);
+              chunkSqlBytes += placeholderBytes;
+            }
+            flush();
+            return statements;
+          }
+
+          function packBatches(groups) {
+            var batches = [];
+            var current = [];
+            var currentBytes = 12; // {"batch":[]}
+
+            for (var i = 0; i < groups.length; i++) {
+              var group = groups[i];
+              if (!group.length) continue;
+              var groupBytes = 0;
+              for (var j = 0; j < group.length; j++) {
+                groupBytes += Buffer.byteLength(JSON.stringify(group[j])) + 1;
+              }
+              if (current.length > 0 &&
+                  (current.length + group.length > MAX_BATCH_STATEMENTS ||
+                   currentBytes + groupBytes > MAX_BATCH_BYTES)) {
+                batches.push(current);
+                current = [];
+                currentBytes = 12;
+              }
+              for (var k = 0; k < group.length; k++) current.push(group[k]);
+              currentBytes += groupBytes;
+            }
+            if (current.length) batches.push(current);
+            return batches;
           }
 
           function readJson(filePath) {
@@ -154,10 +239,16 @@ jobs:
             } catch (e) { return []; }
           }
 
+          function listWidgetFiles() {
+            try {
+              return fs.readdirSync('widgets').filter(function(f) { return f.endsWith('.html'); });
+            } catch (e) { return []; }
+          }
+
           async function main() {
             console.log('Registering content for tenant: ' + TENANT_ID);
 
-            var rows = await d1(PLATFORM_DB_ID,
+            var rows = await d1Query(PLATFORM_DB_ID,
               'SELECT database_id FROM tenant_registry WHERE id = ? LIMIT 1', [TENANT_ID]);
             if (!rows.length) throw new Error('Tenant "' + TENANT_ID + '" not found in registry');
             var dbId = rows[0].database_id;
@@ -165,8 +256,12 @@ jobs:
 
             var moduleCount = 0, courseCount = 0, widgetCount = 0;
             var moduleManifests = {};
+            var moduleRows = [];
+            var courseRows = [];
+            var courseJunctions = [];
+            var widgetRows = [];
 
-            // Register modules
+            // Collect modules
             var moduleDirs = listDirs('modules');
             for (var mi = 0; mi < moduleDirs.length; mi++) {
               var dir = moduleDirs[mi];
@@ -178,20 +273,19 @@ jobs:
               var lessons = (manifest.lessons || []).filter(function(l) { return l.type !== 'quiz'; }).length;
               var quizzes = (manifest.lessons || []).filter(function(l) { return l.type === 'quiz'; }).length;
 
-              await d1(dbId,
-                "INSERT INTO modules (id, r2_base_path, title, description, total_lessons, total_quizzes, status) " +
-                "VALUES (?, ?, ?, ?, ?, ?, 'active') " +
-                "ON CONFLICT(id) DO UPDATE SET " +
-                "title=excluded.title, description=excluded.description, " +
-                "total_lessons=excluded.total_lessons, total_quizzes=excluded.total_quizzes, " +
-                "updated_at=datetime('now')",
-                [id, 'tenants/' + TENANT_ID + '/modules/' + id, manifest.title || id, manifest.description || null, lessons, quizzes]
-              );
+              moduleRows.push([
+                id,
+                'tenants/' + TENANT_ID + '/modules/' + id,
+                manifest.title || id,
+                manifest.description || null,
+                lessons,
+                quizzes
+              ]);
               console.log('  Module: ' + id + ' (' + lessons + ' lessons, ' + quizzes + ' quizzes)');
               moduleCount++;
             }
 
-            // Register courses
+            // Collect courses and course_modules junctions
             var courseDirs = listDirs('courses');
             for (var ci = 0; ci < courseDirs.length; ci++) {
               var cdir = courseDirs[ci];
@@ -209,58 +303,92 @@ jobs:
                 }
               }
 
-              await d1(dbId,
-                "INSERT INTO courses (id, r2_base_path, r2_manifest_path, title, description, " +
-                "total_modules, total_lessons, total_quizzes, cover_image, " +
-                "access_type, status, manifest_format) " +
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'public', 'active', 'blueprint') " +
-                "ON CONFLICT(id) DO UPDATE SET " +
-                "title=excluded.title, description=excluded.description, " +
-                "total_modules=excluded.total_modules, total_lessons=excluded.total_lessons, " +
-                "total_quizzes=excluded.total_quizzes, cover_image=excluded.cover_image, " +
-                "updated_at=datetime('now')",
-                [cid, 'tenants/' + TENANT_ID + '/courses/' + cid,
-                 'tenants/' + TENANT_ID + '/courses/' + cid + '/course.json',
-                 course.title || cid, course.description || null,
-                 moduleIds.length, totalLessons, totalQuizzes,
-                 course.coverImage || null]
-              );
-
-              // Rebuild course_modules junction
-              await d1(dbId, 'DELETE FROM course_modules WHERE course_id = ?', [cid]);
-              for (var k = 0; k < moduleIds.length; k++) {
-                await d1(dbId,
-                  "INSERT INTO course_modules (course_id, module_id, slot_id, slot_type, slot_order) " +
-                  "VALUES (?, ?, ?, 'core', ?)",
-                  [cid, moduleIds[k], 'core-' + k, k]
-                );
-              }
+              courseRows.push([
+                cid,
+                'tenants/' + TENANT_ID + '/courses/' + cid,
+                'tenants/' + TENANT_ID + '/courses/' + cid + '/course.json',
+                course.title || cid,
+                course.description || null,
+                moduleIds.length,
+                totalLessons,
+                totalQuizzes,
+                course.coverImage || null
+              ]);
+              courseJunctions.push({ cid: cid, moduleIds: moduleIds });
               console.log('  Course: ' + cid + ' (' + moduleIds.length + ' modules, ' + totalLessons + ' lessons)');
               courseCount++;
             }
 
-            // Register widgets
-            try {
-              var widgetFiles = fs.readdirSync('widgets').filter(function(f) { return f.endsWith('.html'); });
-              for (var wi = 0; wi < widgetFiles.length; wi++) {
-                var wfile = widgetFiles[wi];
-                var wid = wfile.replace('.html', '');
-                var wtitle = wid.split('-').map(function(w) { return w[0].toUpperCase() + w.slice(1); }).join(' ');
+            // Collect widgets
+            var widgetFiles = listWidgetFiles();
+            for (var wi = 0; wi < widgetFiles.length; wi++) {
+              var wfile = widgetFiles[wi];
+              var wid = wfile.replace('.html', '');
+              var wtitle = wid.split('-').map(function(w) { return w[0].toUpperCase() + w.slice(1); }).join(' ');
 
-                await d1(dbId,
-                  "INSERT INTO widgets (id, title, r2_path, github_path, status) " +
-                  "VALUES (?, ?, ?, ?, 'active') " +
-                  "ON CONFLICT(id) DO UPDATE SET " +
-                  "r2_path=excluded.r2_path, github_path=excluded.github_path, " +
-                  "updated_at=datetime('now')",
-                  [wid, wtitle, 'tenants/' + TENANT_ID + '/widgets/' + wfile, 'widgets/' + wfile]
-                );
-                console.log('  Widget: ' + wid);
-                widgetCount++;
+              widgetRows.push([
+                wid,
+                wtitle,
+                'tenants/' + TENANT_ID + '/widgets/' + wfile,
+                'widgets/' + wfile
+              ]);
+              console.log('  Widget: ' + wid);
+              widgetCount++;
+            }
+
+            // Build ordered statement groups (modules -> courses -> per-course junction rebuild -> widgets)
+            var groups = [];
+
+            var moduleStmts = buildMultiRowStatements(
+              'INSERT INTO modules (id, r2_base_path, title, description, total_lessons, total_quizzes, status) VALUES ',
+              "(?, ?, ?, ?, ?, ?, 'active')",
+              " ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description, total_lessons=excluded.total_lessons, total_quizzes=excluded.total_quizzes, updated_at=datetime('now')",
+              moduleRows
+            );
+            for (var ms = 0; ms < moduleStmts.length; ms++) groups.push([moduleStmts[ms]]);
+
+            var courseStmts = buildMultiRowStatements(
+              'INSERT INTO courses (id, r2_base_path, r2_manifest_path, title, description, total_modules, total_lessons, total_quizzes, cover_image, access_type, status, manifest_format) VALUES ',
+              "(?, ?, ?, ?, ?, ?, ?, ?, ?, 'public', 'active', 'blueprint')",
+              " ON CONFLICT(id) DO UPDATE SET title=excluded.title, description=excluded.description, total_modules=excluded.total_modules, total_lessons=excluded.total_lessons, total_quizzes=excluded.total_quizzes, cover_image=excluded.cover_image, updated_at=datetime('now')",
+              courseRows
+            );
+            for (var cs = 0; cs < courseStmts.length; cs++) groups.push([courseStmts[cs]]);
+
+            // Keep each course's DELETE + INSERT(s) in one atomic group so a batch split cannot leave a course empty.
+            for (var cj = 0; cj < courseJunctions.length; cj++) {
+              var entry = courseJunctions[cj];
+              var group = [{ sql: 'DELETE FROM course_modules WHERE course_id = ?', params: [entry.cid] }];
+              var junctionRows = [];
+              for (var k = 0; k < entry.moduleIds.length; k++) {
+                junctionRows.push([entry.cid, entry.moduleIds[k], 'core-' + k, k]);
               }
-            } catch (e) { /* no widgets dir */ }
+              var insertStmts = buildMultiRowStatements(
+                'INSERT INTO course_modules (course_id, module_id, slot_id, slot_type, slot_order) VALUES ',
+                "(?, ?, ?, 'core', ?)",
+                '',
+                junctionRows
+              );
+              for (var is = 0; is < insertStmts.length; is++) group.push(insertStmts[is]);
+              groups.push(group);
+            }
 
-            console.log('\nRegistered ' + courseCount + ' courses, ' + moduleCount + ' modules, ' + widgetCount + ' widgets');
+            var widgetStmts = buildMultiRowStatements(
+              'INSERT INTO widgets (id, title, r2_path, github_path, status) VALUES ',
+              "(?, ?, ?, ?, 'active')",
+              " ON CONFLICT(id) DO UPDATE SET r2_path=excluded.r2_path, github_path=excluded.github_path, updated_at=datetime('now')",
+              widgetRows
+            );
+            for (var ws = 0; ws < widgetStmts.length; ws++) groups.push([widgetStmts[ws]]);
+
+            var batches = packBatches(groups);
+            var totalStatements = 0;
+            for (var bi = 0; bi < batches.length; bi++) {
+              totalStatements += batches[bi].length;
+              await d1Batch(dbId, batches[bi]);
+            }
+
+            console.log('\nRegistered ' + courseCount + ' courses, ' + moduleCount + ' modules, ' + widgetCount + ' widgets (' + totalStatements + ' SQL statements in ' + batches.length + ' D1 batch call' + (batches.length === 1 ? '' : 's') + ')');
           }
 
           main().catch(function(err) { console.error('D1 registration failed:', err.message); process.exit(1); });
